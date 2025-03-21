@@ -344,6 +344,7 @@ class YouTubeProcessor:
             raise
 
 
+
     def answer_question(self, question: str, num_results: int = 5, video_ids: List[str] = None,
                         tags: List[str] = None, temperature: float = None, max_tokens: int = None) -> str:
         """Answer a question based on the content of the videos."""
@@ -369,14 +370,50 @@ class YouTubeProcessor:
             if not relevant_chunks:
                 return "I couldn't find any relevant information to answer your question."
 
-            # Extract the text from the chunks
-            context = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
+            # Import necessary LangChain components
+            from langchain.schema import Document
+            from langchain.prompts import PromptTemplate
+
+            # Convert chunks to proper LangChain documents
+            documents = []
+            for chunk in relevant_chunks:
+                doc = Document(
+                    page_content=chunk["text"],
+                    metadata={
+                        "source": chunk["title"],
+                        "timestamp": chunk["timestamp"],
+                        "video_id": chunk["video_id"]
+                    }
+                )
+                documents.append(doc)
+
+            print(f"Found {len(relevant_chunks)} relevant segments. Generating answer...")
 
             # Set default values if not provided
             temperature = temperature if temperature is not None else self.config.DEFAULT_TEMPERATURE
             max_tokens = max_tokens if max_tokens is not None else self.config.DEFAULT_MAX_TOKENS
 
-            print(f"Found {len(relevant_chunks)} relevant segments. Generating answer...")
+            # Create a better prompt template
+            prompt_template = """
+            You are an expert at explaining concepts from educational videos.
+            
+            Answer the following question based on the information from the video segments.
+            If the information needed isn't contained in the segments, say "The video segments don't cover this topic."
+            Provide a comprehensive answer that synthesizes information from all relevant segments.
+            
+            Question: {question}
+            
+            Video Content:
+            {context}
+            
+            Answer:
+            """
+
+            # Create the prompt
+            prompt = PromptTemplate(
+                template=prompt_template,
+                input_variables=["context", "question"]
+            )
 
             # Initialize a language model
             llm = ChatOpenAI(
@@ -386,11 +423,10 @@ class YouTubeProcessor:
                 max_tokens=max_tokens
             )
 
-            # Create a QA chain
-            qa_chain = load_qa_chain(llm, chain_type="stuff")
+            # Create a QA chain with our prompt
+            qa_chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
 
             # Generate the answer
-            documents = [Document(page_content=context)]
             result = qa_chain.invoke({"input_documents": documents, "question": question})
 
             # Enhance the answer with source information
@@ -425,7 +461,7 @@ class YouTubeProcessor:
         except Exception as e:
             logger.error(f"Error answering question: {str(e)}")
             return f"An error occurred while trying to answer your question: {str(e)}"
-
+    
 
 def main():
     parser = argparse.ArgumentParser(description="YouTube Search QA Bot")
