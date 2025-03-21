@@ -26,6 +26,8 @@ from sentence_transformers import SentenceTransformer
 from langchain_openai import ChatOpenAI
 from langchain.chains.question_answering import load_qa_chain
 
+from langchain.schema import Document
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -342,88 +344,87 @@ class YouTubeProcessor:
             raise
 
 
-def answer_question(self, question: str, num_results: int = 5, video_ids: List[str] = None, 
-                    tags: List[str] = None, temperature: float = None, max_tokens: int = None) -> str:
-    """Answer a question based on the content of the videos."""
-    try:
-        # Show what we're searching for
-        filter_info = []
-        if video_ids:
-            filter_info.append(f"from {len(video_ids)} specific videos")
-        if tags:
-            filter_info.append(f"with tags: {', '.join(tags)}")
-        
-        filter_msg = f" ({', '.join(filter_info)})" if filter_info else ""
-        print(f"Searching for relevant content{filter_msg}...")
-        
-        # Search for relevant chunks with optional filters
-        relevant_chunks = self.search_similar(
-            question, 
-            limit=num_results,
-            video_ids=video_ids,
-            tags=tags
-        )
-        
-        if not relevant_chunks:
-            return "I couldn't find any relevant information to answer your question."
-        
-        # Extract the text from the chunks
-        context = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
-        
-        # Set default values if not provided
-        temperature = temperature if temperature is not None else self.config.DEFAULT_TEMPERATURE
-        max_tokens = max_tokens if max_tokens is not None else self.config.DEFAULT_MAX_TOKENS
-        
-        print(f"Found {len(relevant_chunks)} relevant segments. Generating answer...")
-        
-        # Initialize a language model
-        llm = ChatOpenAI(
-            api_key=self.config.OPENAI_API_KEY,
-            model_name=self.config.LLM_MODEL,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        
-        # Create a QA chain
-        qa_chain = load_qa_chain(llm, chain_type="stuff")
-        
-        # Generate the answer
-        result = qa_chain.invoke({"input_documents": [{"page_content": context}], "question": question})
-        
-        # Enhance the answer with source information
-        answer = result["output_text"]
-        
-        # Get unique video sources for better organization
-        video_sources = {}
-        for chunk in relevant_chunks:
-            video_id = chunk.get("video_id")
-            title = chunk.get("title", "Unknown")
-            timestamp = chunk.get("timestamp", "Unknown")
-            
-            if video_id not in video_sources:
-                video_sources[video_id] = {"title": title, "timestamps": []}
-            
-            video_sources[video_id]["timestamps"].append(timestamp)
-        
-        # Add source information in a more organized way
-        answer += "\n\nSources:"
-        for i, (video_id, info) in enumerate(video_sources.items()):
-            title = info["title"]
-            timestamps = info["timestamps"]
-            answer += f"\n{i+1}. {title}"
-            
-            # If there are multiple timestamps from the same video, list them
-            if len(timestamps) > 1:
-                answer += " (Times: " + ", ".join(timestamps) + ")"
-            else:
-                answer += f" (Time: {timestamps[0]})"
-        
-        return answer
-    except Exception as e:
-        logger.error(f"Error answering question: {str(e)}")
-        return f"An error occurred while trying to answer your question: {str(e)}"
+    def answer_question(self, question: str, num_results: int = 5, video_ids: List[str] = None,
+                        tags: List[str] = None, temperature: float = None, max_tokens: int = None) -> str:
+        """Answer a question based on the content of the videos."""
+        try:
+            # Show what we're searching for
+            filter_info = []
+            if video_ids:
+                filter_info.append(f"from {len(video_ids)} specific videos")
+            if tags:
+                filter_info.append(f"with tags: {', '.join(tags)}")
 
+            filter_msg = f" ({', '.join(filter_info)})" if filter_info else ""
+            print(f"Searching for relevant content{filter_msg}...")
 
+            # Search for relevant chunks with optional filters
+            relevant_chunks = self.search_similar(
+                question,
+                limit=num_results,
+                video_ids=video_ids,
+                tags=tags
+            )
+
+            if not relevant_chunks:
+                return "I couldn't find any relevant information to answer your question."
+
+            # Extract the text from the chunks
+            context = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
+
+            # Set default values if not provided
+            temperature = temperature if temperature is not None else self.config.DEFAULT_TEMPERATURE
+            max_tokens = max_tokens if max_tokens is not None else self.config.DEFAULT_MAX_TOKENS
+
+            print(f"Found {len(relevant_chunks)} relevant segments. Generating answer...")
+
+            # Initialize a language model
+            llm = ChatOpenAI(
+                api_key=self.config.OPENAI_API_KEY,
+                model_name=self.config.LLM_MODEL,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+
+            # Create a QA chain
+            qa_chain = load_qa_chain(llm, chain_type="stuff")
+
+            # Generate the answer
+            documents = [Document(page_content=context)]
+            result = qa_chain.invoke({"input_documents": documents, "question": question})
+
+            # Enhance the answer with source information
+            answer = result["output_text"]
+
+            # Get unique video sources for better organization
+            video_sources = {}
+            for chunk in relevant_chunks:
+                video_id = chunk.get("video_id")
+                title = chunk.get("title", "Unknown")
+                timestamp = chunk.get("timestamp", "Unknown")
+
+                if video_id not in video_sources:
+                    video_sources[video_id] = {"title": title, "timestamps": []}
+
+                video_sources[video_id]["timestamps"].append(timestamp)
+
+            # Add source information in a more organized way
+            answer += "\n\nSources:"
+            for i, (video_id, info) in enumerate(video_sources.items()):
+                title = info["title"]
+                timestamps = info["timestamps"]
+                answer += f"\n{i+1}. {title}"
+
+                # If there are multiple timestamps from the same video, list them
+                if len(timestamps) > 1:
+                    answer += " (Times: " + ", ".join(timestamps) + ")"
+                else:
+                    answer += f" (Time: {timestamps[0]})"
+
+            return answer
+        except Exception as e:
+            logger.error(f"Error answering question: {str(e)}")
+            return f"An error occurred while trying to answer your question: {str(e)}"
 
 
 def main():
