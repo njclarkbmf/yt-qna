@@ -1,0 +1,11 @@
+whisper-openai
+sentence-transformers
+lancedb
+langchain
+langchain-openai
+python-dotenv
+tqdm
+pandas
+numpy
+pydantic
+yt-dlp
