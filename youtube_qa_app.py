@@ -62,27 +62,44 @@ class VideoChunk(LanceModel):
     class Config:
         use_enum_values = True
 
+# Helper function for cosine similarity
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
 class YouTubeProcessor:
-    def __init__(self, config: Config, whisper_model=None):
+    def __init__(self, config: Config, whisper_model=None, embedding_model_name=None):
         self.config = config
+        
+        # Store model names for lazy loading
+        self._whisper_model = None
+        self._whisper_model_name = whisper_model or self.config.WHISPER_MODEL
+        self._embedding_model = None
+        self._embedding_model_name = embedding_model_name or self.config.EMBEDDING_MODEL
         
         # Create directories if they don't exist
         os.makedirs(self.config.AUDIO_DIR, exist_ok=True)
         os.makedirs(self.config.LANCEDB_PATH, exist_ok=True)
         
-        # Initialize the embedding model
-        self.embedding_model = SentenceTransformer(self.config.EMBEDDING_MODEL)
-        
-        # Connect to LanceDB
+        # Connect to LanceDB - this operation is fast so we can do it immediately
         self.db = lancedb.connect(self.config.LANCEDB_PATH)
-        
-        # Initialize the transcription model
-        whisper_model = whisper_model or self.config.WHISPER_MODEL
-        logger.info(f"Loading Whisper model: {whisper_model}")
-        with tqdm(total=100, desc=f"Loading {whisper_model} model") as pbar:
-            self.whisper_model = whisper.load_model(whisper_model)
-            pbar.update(100)
-
+    
+    @property
+    def embedding_model(self):
+        """Lazy load the embedding model only when needed"""
+        if self._embedding_model is None:
+            logger.info(f"Loading embedding model: {self._embedding_model_name}")
+            self._embedding_model = SentenceTransformer(self._embedding_model_name)
+        return self._embedding_model
+    
+    @property
+    def whisper_model(self):
+        """Lazy load the whisper model only when needed"""
+        if self._whisper_model is None:
+            logger.info(f"Loading Whisper model: {self._whisper_model_name}")
+            with tqdm(total=100, desc=f"Loading {self._whisper_model_name} model") as pbar:
+                self._whisper_model = whisper.load_model(self._whisper_model_name)
+                pbar.update(100)
+        return self._whisper_model
 
     def download_youtube_audio(self, video_url: str, force: bool = False) -> str:
         """Download audio from a YouTube video using yt-dlp and save it to a file."""
@@ -252,7 +269,7 @@ class YouTubeProcessor:
         return chunks
 
     def store_in_lancedb(self, chunks: List[Dict]) -> None:
-        """Store the chunks with embeddings in LanceDB."""
+        """Store the chunks with embeddings in LanceDB with optimized batch processing."""
         logger.info(f"Storing {len(chunks)} chunks in LanceDB")
         
         # Convert to VideoChunk objects
@@ -262,10 +279,15 @@ class YouTubeProcessor:
         table_name = "video_chunks"
         if table_name in self.db.table_names():
             table = self.db.open_table(table_name)
-            # Add data to existing table
-            table.add(video_chunks)
+            
+            # Add data in optimized batch size - this should work with LanceDB 0.21.1
+            BATCH_SIZE = 100  # Adjust based on your system's memory
+            for i in range(0, len(video_chunks), BATCH_SIZE):
+                batch = video_chunks[i:i+BATCH_SIZE]
+                table.add(batch)
+                logger.info(f"Added batch {i//BATCH_SIZE + 1}/{(len(video_chunks)-1)//BATCH_SIZE + 1} ({len(batch)} chunks)")
         else:
-            # Create new table
+            # Create new table - this should work with any LanceDB version
             self.db.create_table(table_name, data=video_chunks)
         
         logger.info(f"Successfully stored chunks in LanceDB table: {table_name}")
@@ -301,13 +323,10 @@ class YouTubeProcessor:
                 if update:
                     # Check if we have existing data
                     if "video_chunks" in self.db.table_names():
-                        table = self.db.open_table("video_chunks")
-                        count = table.count_rows(f"video_id = '{video_id}'")
-                        
-                        if count > 0:
-                            logger.info(f"Found {count} existing chunks for video ID: {video_id}")
-                            logger.info(f"Deleting existing data before reprocessing...")
-                            self.delete_video_data(video_id)
+                        # We'll use the updated delete_video_data method
+                        existing_data = self.delete_video_data(video_id)
+                        if existing_data:
+                            logger.info(f"Deleted existing data for video ID: {video_id}")
                 
                 # Download the audio
                 audio_path, video_id, title = self.download_youtube_audio(video_url, force=force)
@@ -338,7 +357,7 @@ class YouTubeProcessor:
             raise        
 
     def search_similar(self, query: str, limit: int = 5, video_ids: List[str] = None, tags: List[str] = None) -> List[Dict]:
-        """Search for chunks similar to the query, with optional filtering by video_id or tags."""
+        """Search for chunks similar to the query, compatible with LanceDB 0.21.1."""
         try:
             # Generate query embedding
             query_embedding = self.embedding_model.encode(query)
@@ -346,29 +365,55 @@ class YouTubeProcessor:
             # Open the table
             table = self.db.open_table("video_chunks")
             
-            # Start building the search query
-            search_query = table.search(query_embedding)
+            # Get all data from the table and convert to DataFrame
+            df = table.to_pandas()
             
-            # Apply filters if specified
-            if video_ids:
-                video_filter = " OR ".join([f"video_id = '{vid}'" for vid in video_ids])
-                search_query = search_query.where(video_filter)
+            if df.empty:
+                return []
             
-            if tags:
-                # Filter for chunks that have at least one of the specified tags
-                # LanceDB supports array_contains function for array fields
-                tags_filter = " OR ".join([f"array_contains(tags, '{tag}')" for tag in tags])
-                search_query = search_query.where(tags_filter)
+            # Convert embeddings to numpy arrays if they're stored as lists
+            df['embedding_array'] = df['embedding'].apply(lambda x: np.array(x) if isinstance(x, list) else x)
             
-            # Execute the search and limit results
-            results = search_query.limit(limit).to_pandas()
+            # Calculate similarities manually
+            similarities = []
+            for idx, row in df.iterrows():
+                # Calculate cosine similarity
+                sim = cosine_similarity(query_embedding, row['embedding_array'])
+                similarities.append((row, sim))
             
-            return results.to_dict('records')
+            # Sort by similarity (highest first)
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            
+            # Apply filters if needed
+            filtered_results = []
+            for row, sim in similarities:
+                keep_row = True
+                
+                # Filter by video_ids if specified
+                if video_ids and row['video_id'] not in video_ids:
+                    keep_row = False
+                    
+                # Filter by tags if specified
+                if tags and keep_row:
+                    row_tags = row.get('tags', [])
+                    # Convert numpy arrays to lists if needed
+                    if hasattr(row_tags, 'tolist'):
+                        row_tags = row_tags.tolist()
+                        
+                    if not any(tag in row_tags for tag in tags):
+                        keep_row = False
+                
+                if keep_row:
+                    filtered_results.append(row)
+                    if len(filtered_results) >= limit:
+                        break
+            
+            # Convert results to dict format
+            return [row.to_dict() for row in filtered_results]
+            
         except Exception as e:
             logger.error(f"Error searching: {str(e)}")
             raise
-
-
 
     def answer_question(self, question: str, num_results: int = 5, video_ids: List[str] = None,
                         tags: List[str] = None, temperature: float = None, max_tokens: int = None) -> str:
@@ -487,17 +532,8 @@ class YouTubeProcessor:
             logger.error(f"Error answering question: {str(e)}")
             return f"An error occurred while trying to answer your question: {str(e)}"
 
-
     def delete_video_data(self, video_id: str) -> bool:
-        """
-        Delete all chunks associated with a specific video ID from the database.
-        
-        Args:
-            video_id: The YouTube video ID to delete
-            
-        Returns:
-            bool: True if successful, False if no data was found
-        """
+        """Delete all chunks associated with a specific video ID from the database."""
         try:
             # Check if the table exists
             if "video_chunks" not in self.db.table_names():
@@ -507,21 +543,54 @@ class YouTubeProcessor:
             # Open the table
             table = self.db.open_table("video_chunks")
             
-            # Count rows before deletion to verify we had matching data
-            count_before = table.count_rows(f"video_id = '{video_id}'")
+            # Get the existing data
+            df = table.to_pandas()
+            
+            # Count rows before deletion
+            matching_rows = df[df['video_id'] == video_id]
+            count_before = len(matching_rows)
             
             if count_before == 0:
                 logger.warning(f"No data found for video ID: {video_id}")
                 return False
-                
-            # Delete all entries with matching video_id
-            table.delete(f"video_id = '{video_id}'")
             
-            # Verify deletion
-            count_after = table.count_rows(f"video_id = '{video_id}'")
+            # Get rows that don't match the video_id
+            remaining_df = df[df['video_id'] != video_id]
+            
+            # Check if all data is being deleted
+            if len(remaining_df) == 0:
+                logger.info(f"Deleting all data from the table...")
+                # If all data is being deleted, drop the table
+                self.db.drop_table("video_chunks")
+                logger.info(f"Deleted {count_before} chunks for video ID: {video_id}")
+                return True
+            
+            # Otherwise, create a new table with the remaining data
+            logger.info(f"Creating backup of existing data...")
+            backup_table_name = f"video_chunks_backup_{int(time.time())}"
+            self.db.create_table(backup_table_name, data=df)
+            
+            logger.info(f"Recreating table without deleted chunks...")
+            # Drop the original table
+            self.db.drop_table("video_chunks")
+            
+            # Create a new table with the remaining data
+            remaining_records = []
+            for _, row in remaining_df.iterrows():
+                record = row.to_dict()
+                # Handle numpy arrays in tags
+                if 'tags' in record and hasattr(record['tags'], 'tolist'):
+                    record['tags'] = record['tags'].tolist()
+                # Handle numpy arrays in embedding
+                if 'embedding' in record and hasattr(record['embedding'], 'tolist'):
+                    record['embedding'] = record['embedding'].tolist()
+                remaining_records.append(VideoChunk(**record))
+            
+            if remaining_records:
+                self.db.create_table("video_chunks", data=remaining_records)
             
             logger.info(f"Deleted {count_before} chunks for video ID: {video_id}")
-            return count_after == 0
+            return True
             
         except Exception as e:
             logger.error(f"Error deleting video data: {str(e)}")
@@ -545,17 +614,8 @@ class YouTubeProcessor:
             logger.error(f"Error extracting video ID from URL: {str(e)}")
             return False
 
-
     def list_videos(self, tags: List[str] = None) -> pd.DataFrame:
-        """
-        List all videos in the database with optional tag filtering.
-        
-        Args:
-            tags: Optional list of tags to filter by
-            
-        Returns:
-            DataFrame with video information
-        """
+        """List all videos in the database with optional tag filtering."""
         try:
             if "video_chunks" not in self.db.table_names():
                 logger.warning("No video_chunks table exists yet")
@@ -564,33 +624,321 @@ class YouTubeProcessor:
             # Open the table
             table = self.db.open_table("video_chunks")
             
-            # Get all videos with their titles
-            query = "SELECT DISTINCT video_id, title, tags FROM video_chunks"
+            # Get all data
+            df = table.to_pandas()
             
-            # Filter by tags if provided
-            if tags:
-                tags_filter = " OR ".join([f"array_contains(tags, '{tag}')" for tag in tags])
-                query += f" WHERE {tags_filter}"
+            if df.empty:
+                return pd.DataFrame()
                 
-            results = table.query(query).to_pandas()
-            
-            # Add count of chunks for each video
-            if not results.empty:
-                # Add a column with the number of chunks for each video
-                chunk_counts = []
-                for video_id in results['video_id']:
-                    count = table.count_rows(f"video_id = '{video_id}'")
-                    chunk_counts.append(count)
+            # Process the data to get unique video entries
+            video_data = {}
+            for _, row in df.iterrows():
+                video_id = row['video_id']
+                title = row['title']
+                row_tags = row.get('tags', [])
+                
+                # Convert numpy arrays to lists if needed
+                if hasattr(row_tags, 'tolist'):
+                    row_tags = row_tags.tolist()
                     
-                results['num_chunks'] = chunk_counts
-            
+                # Skip if we're filtering by tags and this video doesn't match
+                if tags and not any(tag in row_tags for tag in tags):
+                    continue
+                    
+                if video_id not in video_data:
+                    video_data[video_id] = {
+                        'video_id': video_id,
+                        'title': title,
+                        'tags': row_tags,
+                        'num_chunks': 1
+                    }
+                else:
+                    video_data[video_id]['num_chunks'] += 1
+                    
+            # Convert to DataFrame
+            results = pd.DataFrame(list(video_data.values())) if video_data else pd.DataFrame()
             return results
+            
         except Exception as e:
             logger.error(f"Error listing videos: {str(e)}")
             return pd.DataFrame()    
+
+
+# Standalone function implementations for lightweight operations
+def list_videos_standalone(config, tags=None):
+    """List all videos in the database with optional tag filtering without loading models."""
+    try:
+        db = lancedb.connect(config.LANCEDB_PATH)
+        
+        if "video_chunks" not in db.table_names():
+            print("No video_chunks table exists yet")
+            return
+            
+        # Open the table
+        table = db.open_table("video_chunks")
+        
+        # Get all data from the table
+        df = table.to_pandas()
+        
+        if df.empty:
+            print("No videos found")
+            return
+        
+        # Process the data in Python instead of using SQL queries
+        # Group by video_id and get the first title for each
+        video_data = {}
+        for _, row in df.iterrows():
+            video_id = row['video_id']
+            title = row['title']
+            row_tags = row.get('tags', [])
+            
+            # Convert numpy arrays to lists if needed
+            if hasattr(row_tags, 'tolist'):
+                row_tags = row_tags.tolist()
+            
+            # Skip if we're filtering by tags and this video doesn't match
+            if tags:
+                tags_list = [tag.strip() for tag in tags.split(',')]
+                if not any(tag in row_tags for tag in tags_list):
+                    continue
+            
+            if video_id not in video_data:
+                video_data[video_id] = {
+                    'title': title,
+                    'tags': row_tags,
+                    'count': 1
+                }
+            else:
+                video_data[video_id]['count'] += 1
+        
+        if not video_data:
+            print("No videos found")
+            return
+            
+        print(f"Found {len(video_data)} videos in database:")
+        for i, (video_id, data) in enumerate(video_data.items()):
+            tags_str = ", ".join(data['tags']) if data['tags'] else "No tags"
+            print(f"{i+1}. {data['title']} (ID: {video_id}) - {tags_str}")
+            print(f"   Chunks: {data['count']}")
+            
+    except Exception as e:
+        print(f"Error listing videos: {str(e)}")
+        import traceback
+        traceback.print_exc()  # Print the full error for debugging
+
+def delete_video_data_standalone(config, video_id):
+    """Delete all chunks for a specific video ID without loading models."""
+    try:
+        db = lancedb.connect(config.LANCEDB_PATH)
+        
+        if "video_chunks" not in db.table_names():
+            print(f"No video_chunks table exists yet")
+            return False
+            
+        # Open the table
+        table = db.open_table("video_chunks")
+        
+        # Get the existing data
+        df = table.to_pandas()
+        
+        # Count rows before deletion
+        matching_rows = df[df['video_id'] == video_id]
+        count_before = len(matching_rows)
+        
+        if count_before == 0:
+            print(f"No data found for video ID: {video_id}")
+            return False
+        
+        # For older versions of LanceDB, we need to recreate the table without the rows
+        # This is inefficient but works for any version
+        print(f"Found {count_before} chunks to delete...")
+        
+        # Get rows that don't match the video_id
+        remaining_df = df[df['video_id'] != video_id]
+        
+        # Check if all data is being deleted
+        if len(remaining_df) == 0:
+            print("Deleting all data from the table...")
+            # If all data is being deleted, drop the table and recreate it empty
+            db.drop_table("video_chunks")
+            if count_before > 0:
+                print(f"Successfully deleted {count_before} chunks for video ID: {video_id}")
+            return True
+        
+        # Otherwise, create a new table with the remaining data
+        print("Creating backup of existing data...")
+        backup_table_name = f"video_chunks_backup_{int(time.time())}"
+        db.create_table(backup_table_name, data=df)
+        
+        print("Recreating table without deleted chunks...")
+        # Drop the original table
+        db.drop_table("video_chunks")
+        
+        # Create a new table with the remaining data
+        remaining_records = []
+        for _, row in remaining_df.iterrows():
+            record = row.to_dict()
+            # Handle numpy arrays in tags
+            if 'tags' in record and hasattr(record['tags'], 'tolist'):
+                record['tags'] = record['tags'].tolist()
+            # Handle numpy arrays in embedding
+            if 'embedding' in record and hasattr(record['embedding'], 'tolist'):
+                record['embedding'] = record['embedding'].tolist()
+            remaining_records.append(VideoChunk(**record))
+        
+        if remaining_records:
+            db.create_table("video_chunks", data=remaining_records)
+        
+        print(f"Successfully deleted {count_before} chunks for video ID: {video_id}")
+        return True
+        
+    except Exception as e:
+        print(f"Error deleting video data: {str(e)}")
+        import traceback
+        traceback.print_exc()  # Print the full error for debugging
+        return False
+
+def display_system_info(config):
+    """Display system information without loading models."""
+    print("YouTube QA Bot - System Information")
+    print(f"Configuration:")
+    print(f"  Database path: {config.LANCEDB_PATH}")
+    print(f"  Audio directory: {config.AUDIO_DIR}")
+    print(f"  Chunk size: {config.CHUNK_SIZE}")
+    print(f"  Chunk overlap: {config.CHUNK_OVERLAP}")
+    print(f"  Default embedding model: {config.EMBEDDING_MODEL}")
+    print(f"  Default Whisper model: {config.WHISPER_MODEL}")
+    print(f"  LLM model: {config.LLM_MODEL}")
     
+    # Check if LanceDB version can be determined
+    try:
+        lancedb_version = getattr(lancedb, "__version__", "unknown")
+        print(f"  LanceDB version: {lancedb_version}")
+    except:
+        print(f"  LanceDB version: unknown")
+    
+    # Check if database exists and show stats
+    if os.path.exists(config.LANCEDB_PATH):
+        db = lancedb.connect(config.LANCEDB_PATH)
+        if "video_chunks" in db.table_names():
+            table = db.open_table("video_chunks")
+            
+            try:
+                # Get all data to count manually
+                df = table.to_pandas()
+                total_chunks = len(df)
+                unique_videos = df['video_id'].nunique() if not df.empty else 0
+                
+                print(f"\nDatabase Statistics:")
+                print(f"  Total chunks in database: {total_chunks}")
+                print(f"  Total unique videos: {unique_videos}")
+                
+                if unique_videos > 0:
+                    # Show some details about the videos
+                    print("\nVideos in database:")
+                    video_counts = {}
+                    for _, row in df.iterrows():
+                        video_id = row['video_id']
+                        title = row['title']
+                        if video_id not in video_counts:
+                            video_counts[video_id] = {'title': title, 'count': 1}
+                        else:
+                            video_counts[video_id]['count'] += 1
+                    
+                    for video_id, data in video_counts.items():
+                        print(f"  - {data['title']} (ID: {video_id}, Chunks: {data['count']})")
+                
+            except Exception as e:
+                print(f"\nError getting statistics: {str(e)}")
+                
+        else:
+            print("\nNo video data in database yet.")
+    else:
+        print("\nDatabase directory does not exist yet.")
+
+
+def download_only(config, args):
+    """Download video only and prepare for later processing."""
+    try:
+        video_url = args.url
+        import yt_dlp
+        
+        # Extract video ID from URL
+        video_id = video_url.split("watch?v=")[1].split("&")[0]
+        
+        # Create pending directory if it doesn't exist
+        pending_dir = os.path.join(config.AUDIO_DIR, "pending")
+        os.makedirs(pending_dir, exist_ok=True)
+        
+        # Check if audio file already exists
+        audio_path = os.path.join(config.AUDIO_DIR, f"{video_id}.mp3")
+        pending_file = os.path.join(pending_dir, f"{video_id}.json")
+        
+        force = args.force if hasattr(args, 'force') else False
+        
+        if os.path.exists(audio_path) and not force:
+            print(f"Audio file already exists: {audio_path}")
+            # We need to get the title separately
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                title = info.get('title', 'Unknown Title')
+            print(f"\nUsing existing audio file for: {title}")
+        else:
+            # Set up yt-dlp options
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'outtmpl': f'{config.AUDIO_DIR}/{video_id}',
+                'progress_hooks': [lambda d: print(f"\rDownloading: {d['_percent_str']} of {d.get('_total_bytes_str', 'Unknown size')}       ", end='')],
+            }
+            
+            # Download the audio
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                title = info.get('title', 'Unknown Title')
+            
+            print(f"\nDownloaded audio for: {title}")
+        
+        # Process tags if provided
+        tags = None
+        if hasattr(args, 'tags') and args.tags:
+            tags = [tag.strip() for tag in args.tags.split(',')]
+        
+        # Create metadata for later processing
+        metadata = {
+            'video_id': video_id,
+            'title': title,
+            'url': video_url,
+            'date_downloaded': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'whisper_model': args.whisper_model if hasattr(args, 'whisper_model') and args.whisper_model else config.WHISPER_MODEL,
+            'chunk_size': args.chunk_size if hasattr(args, 'chunk_size') and args.chunk_size else config.CHUNK_SIZE,
+            'chunk_overlap': args.chunk_overlap if hasattr(args, 'chunk_overlap') and args.chunk_overlap else config.CHUNK_OVERLAP,
+            'update': not args.no_update if hasattr(args, 'no_update') else True,
+            'tags': tags
+        }
+        
+        # Save metadata for later processing
+        with open(pending_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"Video queued for processing: {title}")
+        print(f"To complete processing, run: python process_later.py --video-id {video_id}")
+        print(f"Or process all pending videos: python process_later.py --all")
+        
+    except Exception as e:
+        print(f"Error downloading video: {str(e)}")
+        import traceback
+        traceback.print_exc()  # Print the full error for debugging
+
+
 def main():
     parser = argparse.ArgumentParser(description="YouTube Search QA Bot")
+    parser.add_argument("--fast", action="store_true", help="Run in fast mode with minimal loading")
+    
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
     # Add video command
@@ -623,92 +971,104 @@ def main():
     list_parser = subparsers.add_parser("list", help="List videos in the database")
     list_parser.add_argument("--tags", help="Filter by comma-separated list of tags")
     
+    # Info command (new)
+    info_parser = subparsers.add_parser("info", help="Display system information")
+    
     # Parse arguments
     args = parser.parse_args()
     
-    # Initialize the processor
+    # Initialize config
     config = Config()
-    processor = YouTubeProcessor(config, whisper_model=args.whisper_model if hasattr(args, 'whisper_model') else None)
     
-    if args.command == "add":
-        # Process tags if provided
-        tags = None
-        if hasattr(args, 'tags') and args.tags:
-            tags = [tag.strip() for tag in args.tags.split(',')]
-            
-        processor.process_video(
-            args.url,
-            tags=tags,
-            force=args.force if hasattr(args, 'force') else False,
-            chunk_size=args.chunk_size if hasattr(args, 'chunk_size') else None,
-            chunk_overlap=args.chunk_overlap if hasattr(args, 'chunk_overlap') else None,
-            update=not args.no_update if hasattr(args, 'no_update') else True
-        )
-    elif args.command == "query":
-        # Process video IDs if provided
-        video_ids = None
-        if hasattr(args, 'videos') and args.videos:
-            video_ids = [vid.strip() for vid in args.videos.split(',')]
-            
-        # Process tags if provided
-        tags = None
-        if hasattr(args, 'tags') and args.tags:
-            tags = [tag.strip() for tag in args.tags.split(',')]
-            
-        answer = processor.answer_question(
-            args.question,
-            num_results=args.results,
-            video_ids=video_ids,
-            tags=tags,
-            temperature=args.temperature if hasattr(args, 'temperature') else None,
-            max_tokens=args.max_tokens if hasattr(args, 'max_tokens') else None
-        )
-        print("\nAnswer:")
-        print(answer)
-    elif args.command == "delete":
-        if hasattr(args, 'video_id') and args.video_id:
-            success = processor.delete_video_data(args.video_id)
-            if success:
-                print(f"Successfully deleted data for video ID: {args.video_id}")
+    # Check for fast mode
+    fast_mode = args.fast if hasattr(args, 'fast') else False
+    
+    # Commands that can use lightweight processing
+    fast_compatible_commands = ["list", "delete", "info"]
+    
+    if args.command in fast_compatible_commands or fast_mode:
+        # Process commands that don't need the full models loaded
+        if args.command == "list":
+            list_videos_standalone(config, tags=args.tags if hasattr(args, 'tags') and args.tags else None)
+        
+        elif args.command == "delete":
+            if hasattr(args, 'video_id') and args.video_id:
+                success = delete_video_data_standalone(config, args.video_id)
+                if success:
+                    print(f"Successfully deleted data for video ID: {args.video_id}")
+                else:
+                    print(f"No data found for video ID: {args.video_id}")
+            elif hasattr(args, 'url') and args.url:
+                try:
+                    video_id = args.url.split("watch?v=")[1].split("&")[0]
+                    success = delete_video_data_standalone(config, video_id)
+                    if success:
+                        print(f"Successfully deleted data for video URL: {args.url}")
+                    else:
+                        print(f"Failed to delete data for video URL: {args.url}")
+                except Exception as e:
+                    print(f"Error extracting video ID from URL: {str(e)}")
             else:
-                print(f"No data found for video ID: {args.video_id}")
-        elif hasattr(args, 'url') and args.url:
-            success = processor.delete_video_by_url(args.url)
-            if success:
-                print(f"Successfully deleted data for video URL: {args.url}")
-            else:
-                print(f"Failed to delete data for video URL: {args.url}")
-        else:
-            print("Please provide either --video-id or --url to delete")
-    elif args.command == "list":
-        if "video_chunks" not in processor.db.table_names():
-            print("No videos in database yet")
-            return
-            
-        # Open the table
-        table = processor.db.open_table("video_chunks")
+                print("Please provide either --video-id or --url to delete")
         
-        # Get all videos with their titles
-        query = "SELECT DISTINCT video_id, title, tags FROM video_chunks"
+        elif args.command == "info":
+            # Show system information without loading models
+            display_system_info(config)
         
-        # Filter by tags if provided
-        if hasattr(args, 'tags') and args.tags:
-            tags = [tag.strip() for tag in args.tags.split(',')]
-            tags_filter = " OR ".join([f"array_contains(tags, '{tag}')" for tag in tags])
-            query += f" WHERE {tags_filter}"
-            
-        results = table.query(query).to_pandas()
+        # Handle add and query in fast mode with limited functionality
+        elif args.command == "add" and fast_mode:
+            print("Running 'add' in fast mode - only downloading the video without processing.")
+            print("Run process_later.py afterward to complete the processing.")
+            # Perform download-only operation here
+            download_only(config, args)
         
-        if len(results) == 0:
-            print("No videos found")
-            return
-            
-        print(f"Found {len(results)} videos in database:")
-        for i, row in results.iterrows():
-            tags_str = ", ".join(row["tags"]) if row["tags"] else "No tags"
-            print(f"{i+1}. {row['title']} (ID: {row['video_id']}) - {tags_str}")
+        elif args.command == "query" and fast_mode:
+            print("Warning: Running query in fast mode is not supported.")
+            print("For queries, a full processor initialization is required.")
+            print("Run without --fast flag for query operations.")
     else:
-        parser.print_help()
+        # For commands requiring the full processor, initialize it as normal
+        processor = YouTubeProcessor(config, 
+                                   whisper_model=args.whisper_model if hasattr(args, 'whisper_model') else None)
+        
+        if args.command == "add":
+            # Process tags if provided
+            tags = None
+            if hasattr(args, 'tags') and args.tags:
+                tags = [tag.strip() for tag in args.tags.split(',')]
+                
+            processor.process_video(
+                args.url,
+                tags=tags,
+                force=args.force if hasattr(args, 'force') else False,
+                chunk_size=args.chunk_size if hasattr(args, 'chunk_size') else None,
+                chunk_overlap=args.chunk_overlap if hasattr(args, 'chunk_overlap') else None,
+                update=not args.no_update if hasattr(args, 'no_update') else True
+            )
+        elif args.command == "query":
+            # Process video IDs if provided
+            video_ids = None
+            if hasattr(args, 'videos') and args.videos:
+                video_ids = [vid.strip() for vid in args.videos.split(',')]
+                
+            # Process tags if provided
+            tags = None
+            if hasattr(args, 'tags') and args.tags:
+                tags = [tag.strip() for tag in args.tags.split(',')]
+                
+            answer = processor.answer_question(
+                args.question,
+                num_results=args.results,
+                video_ids=video_ids,
+                tags=tags,
+                temperature=args.temperature if hasattr(args, 'temperature') else None,
+                max_tokens=args.max_tokens if hasattr(args, 'max_tokens') else None
+            )
+            print("\nAnswer:")
+            print(answer)
+        else:
+            parser.print_help()
+
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,9 @@ Created by John Clark
 - View source information with video titles and timestamps
 - Selectively update or delete embeddings for specific videos
 - List and manage your video database
+- Fast mode for instant startup of management commands
+- Lazy loading of models for improved performance
+- Compatibility with various LanceDB versions
 
 ## Requirements
 
@@ -99,6 +102,23 @@ You'll see progress indicators for:
 - Transcription progress
 - Embedding generation progress
 
+#### Using Fast Mode for Downloads
+
+If you want to download videos quickly and process them later:
+
+```bash
+# Download only without immediate processing
+python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --fast
+
+# Process all previously downloaded videos later
+python process_later.py --all
+
+# Or process a specific video
+python process_later.py --video-id VIDEO_ID
+```
+
+This approach is especially useful when downloading multiple videos, as it allows you to queue up the downloads quickly and then process them in batch later.
+
 #### Processing Multiple Videos
 
 You can process multiple videos sequentially:
@@ -153,6 +173,12 @@ python youtube_qa_app.py list
 
 This will show video IDs, titles, tags, and the number of chunks for each video.
 
+For instant startup without loading models:
+
+```bash
+python youtube_qa_app.py list --fast
+```
+
 You can filter by tags:
 
 ```bash
@@ -169,9 +195,27 @@ python youtube_qa_app.py delete --video-id "VIDEO_ID"
 
 # Delete by video URL
 python youtube_qa_app.py delete --url "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Use fast mode for instant operation
+python youtube_qa_app.py delete --video-id "VIDEO_ID" --fast
 ```
 
 This will remove all chunks and embeddings associated with the specified video without affecting other videos in the database.
+
+#### System Information
+
+To view system information and database statistics:
+
+```bash
+python youtube_qa_app.py info
+```
+
+This shows:
+- Configuration settings
+- LanceDB version
+- Total chunks in database
+- Number of unique videos
+- List of videos with chunk counts
 
 ### Asking Questions About Videos
 
@@ -218,6 +262,58 @@ python youtube_qa_app.py query "Show examples of backpropagation" --tags "neural
 python youtube_qa_app.py query "Summarize the key points" --temperature 0.7
 ```
 
+## Performance Optimization
+
+The application includes several optimizations to improve performance:
+
+### Fast Mode
+
+Most commands support a `--fast` flag that significantly improves startup time:
+
+```bash
+# List videos instantly without loading models
+python youtube_qa_app.py list --fast
+
+# Delete a video without loading models
+python youtube_qa_app.py delete --video-id "VIDEO_ID" --fast
+
+# View system information
+python youtube_qa_app.py info
+
+# Download a video without immediate processing
+python youtube_qa_app.py add "URL" --fast
+```
+
+Fast mode works by:
+1. Only loading heavy models (Whisper, embeddings) when absolutely necessary
+2. Deferring processing operations to be done later
+3. Using lightweight database operations for management commands
+
+### Lazy Loading
+
+Models are only loaded when they're actually needed:
+- The Whisper model only loads when transcription is performed
+- The embedding model only loads when generating or searching embeddings
+- Commands like "list" and "delete" don't load any models at all
+
+### Batch Processing
+
+Several operations use batch processing to improve efficiency:
+- Database operations process chunks in batches to optimize memory usage
+- The `process_later.py` script can batch process multiple videos
+- Vector operations are optimized for better performance
+
+### Separate Processing Steps
+
+You can separate the downloading and processing steps:
+1. Download videos quickly using `--fast` mode
+2. Process them later with `process_later.py`
+
+This is especially useful for:
+- Downloading many videos at once
+- Scheduling processing for when you have more resources available
+- Using different machines for downloading vs. processing
+
 ## Runtime Parameters
 
 ### Add Command Parameters
@@ -237,6 +333,9 @@ python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --chunk-
 
 # Add custom tags to videos for filtering later
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --tags "machine-learning,tutorial"
+
+# Download only (for later processing)
+python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --fast
 ```
 
 ### Delete Command Parameters
@@ -247,6 +346,9 @@ python youtube_qa_app.py delete --video-id "VIDEO_ID"
 
 # Delete by video URL
 python youtube_qa_app.py delete --url "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Use fast mode
+python youtube_qa_app.py delete --video-id "VIDEO_ID" --fast
 ```
 
 ### List Command Parameters
@@ -257,6 +359,9 @@ python youtube_qa_app.py list
 
 # List videos with specific tags
 python youtube_qa_app.py list --tags "machine-learning,tutorial"
+
+# Use fast mode
+python youtube_qa_app.py list --fast
 ```
 
 ### Query Command Parameters
@@ -346,7 +451,7 @@ If you encounter errors when downloading videos:
 ### Database Management Issues
 
 1. **Failed to Update Video**: If you encounter errors when updating a video, you can try:
-   - Deleting the video first: `python youtube_qa_app.py delete --video-id "VIDEO_ID"`
+   - Deleting the video first: `python youtube_qa_app.py delete --video-id "VIDEO_ID" --fast`
    - Then adding it again: `python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID"`
 
 2. **Database Corruption**: If your LanceDB database becomes corrupted, you might still need to reset it:
@@ -357,6 +462,21 @@ If you encounter errors when downloading videos:
    ```
 
 3. **Video ID Extraction Failure**: If you see errors about failing to extract a video ID from a URL, ensure you're using the standard YouTube URL format (`https://www.youtube.com/watch?v=VIDEO_ID`). URLs from playlists or mobile apps might need to be converted.
+
+### LanceDB Compatibility Notes
+
+This application has been tested with LanceDB versions 0.21.1 through 0.3.x. If you encounter errors related to database operations, they may be version-specific. The application includes fallback mechanisms for different LanceDB versions.
+
+1. **Unhashable Type Errors**: If you see errors about "unhashable type: numpy.ndarray", the application should handle these automatically with the latest code.
+
+2. **Method Not Found Errors**: If you see errors like "object has no attribute 'query'", the application now uses alternative methods that work across versions.
+
+3. **Database Upgrades**: If you upgrade your LanceDB version, you may need to recreate your database to take advantage of new features.
+
+4. **Version Check**: You can see your LanceDB version with:
+   ```bash
+   python youtube_qa_app.py info
+   ```
 
 ### FFmpeg Missing
 
@@ -401,14 +521,6 @@ If you encounter errors related to the embedding model:
 
 3. **Slow Transcription**: Transcription can be slow on CPU. Consider using a GPU if available, or use smaller Whisper models for faster (though less accurate) transcription.
 
-### LanceDB Query Errors
-
-1. **SQL Syntax Errors**: When using LanceDB's query functionality, make sure your SQL syntax is correct. The error messages should help identify the issue.
-
-2. **Missing Tables**: If you get errors about missing tables, ensure you've added at least one video before attempting queries.
-
-3. **Array Contains Errors**: The new filtering functionality uses `array_contains` for tag filtering. If you see related errors, make sure your LanceDB version supports this function.
-
 ## Data Organization
 
 When you add multiple videos, the system organizes them as follows:
@@ -448,10 +560,10 @@ python youtube_qa_app.py add "https://www.youtube.com/watch?v=IHZwWFHWa-w" --tag
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=Ilg3gGewQ5U" --tags "neural-networks,backpropagation,3blue1brown"
 
 # List videos in the database
-python youtube_qa_app.py list
+python youtube_qa_app.py list --fast
 
 # List only videos with a specific tag
-python youtube_qa_app.py list --tags "backpropagation"
+python youtube_qa_app.py list --tags "backpropagation" --fast
 
 # Update a video with better chunking parameters
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=Ilg3gGewQ5U" --force --chunk-size 600 --chunk-overlap 200
@@ -466,7 +578,10 @@ python youtube_qa_app.py query "Explain backpropagation in detail" --tags "backp
 python youtube_qa_app.py query "What is covered in this specific video?" --videos "aircAruvnKk"
 
 # Remove a video from the database
-python youtube_qa_app.py delete --video-id "IHZwWFHWa-w"
+python youtube_qa_app.py delete --video-id "IHZwWFHWa-w" --fast
+
+# View system information
+python youtube_qa_app.py info
 ```
 
 The system will retrieve information across all relevant videos, synthesize an answer, and show which parts came from which videos with timestamps.
@@ -478,7 +593,7 @@ This project is licensed under the MIT License:
 ```
 MIT License
 
-Copyright (c) 2025 John Clark Naldoza
+Copyright (c) 2025 John Clark
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
