@@ -271,8 +271,18 @@ class YouTubeProcessor:
         logger.info(f"Successfully stored chunks in LanceDB table: {table_name}")
 
     def process_video(self, video_url: str, tags: List[str] = None, force: bool = False, 
-                      chunk_size: int = None, chunk_overlap: int = None) -> None:
-        """Process a YouTube video: download, transcribe, chunk, embed, and store."""
+                    chunk_size: int = None, chunk_overlap: int = None, update: bool = True) -> None:
+        """
+        Process a YouTube video: download, transcribe, chunk, embed, and store.
+        
+        Args:
+            video_url: The YouTube video URL to process
+            tags: Optional list of tags to associate with the video
+            force: Force re-download and re-processing even if audio exists
+            chunk_size: Override the default chunk size
+            chunk_overlap: Override the default chunk overlap
+            update: If True, delete existing entries for this video before adding new ones
+        """
         try:
             # Override chunk settings if provided
             original_chunk_size = self.config.CHUNK_SIZE
@@ -284,6 +294,21 @@ class YouTubeProcessor:
                 self.config.CHUNK_OVERLAP = chunk_overlap
                 
             try:
+                # Extract video ID from URL before downloading
+                video_id = video_url.split("watch?v=")[1].split("&")[0]
+                
+                # If update is True, delete existing entries
+                if update:
+                    # Check if we have existing data
+                    if "video_chunks" in self.db.table_names():
+                        table = self.db.open_table("video_chunks")
+                        count = table.count_rows(f"video_id = '{video_id}'")
+                        
+                        if count > 0:
+                            logger.info(f"Found {count} existing chunks for video ID: {video_id}")
+                            logger.info(f"Deleting existing data before reprocessing...")
+                            self.delete_video_data(video_id)
+                
                 # Download the audio
                 audio_path, video_id, title = self.download_youtube_audio(video_url, force=force)
                 
@@ -310,7 +335,7 @@ class YouTubeProcessor:
                 
         except Exception as e:
             logger.error(f"Error processing video {video_url}: {str(e)}")
-            raise
+            raise        
 
     def search_similar(self, query: str, limit: int = 5, video_ids: List[str] = None, tags: List[str] = None) -> List[Dict]:
         """Search for chunks similar to the query, with optional filtering by video_id or tags."""
@@ -461,8 +486,109 @@ class YouTubeProcessor:
         except Exception as e:
             logger.error(f"Error answering question: {str(e)}")
             return f"An error occurred while trying to answer your question: {str(e)}"
-    
 
+
+    def delete_video_data(self, video_id: str) -> bool:
+        """
+        Delete all chunks associated with a specific video ID from the database.
+        
+        Args:
+            video_id: The YouTube video ID to delete
+            
+        Returns:
+            bool: True if successful, False if no data was found
+        """
+        try:
+            # Check if the table exists
+            if "video_chunks" not in self.db.table_names():
+                logger.warning(f"No video_chunks table exists yet")
+                return False
+                
+            # Open the table
+            table = self.db.open_table("video_chunks")
+            
+            # Count rows before deletion to verify we had matching data
+            count_before = table.count_rows(f"video_id = '{video_id}'")
+            
+            if count_before == 0:
+                logger.warning(f"No data found for video ID: {video_id}")
+                return False
+                
+            # Delete all entries with matching video_id
+            table.delete(f"video_id = '{video_id}'")
+            
+            # Verify deletion
+            count_after = table.count_rows(f"video_id = '{video_id}'")
+            
+            logger.info(f"Deleted {count_before} chunks for video ID: {video_id}")
+            return count_after == 0
+            
+        except Exception as e:
+            logger.error(f"Error deleting video data: {str(e)}")
+            return False
+
+    def delete_video_by_url(self, video_url: str) -> bool:
+        """
+        Delete all chunks associated with a YouTube video URL from the database.
+        
+        Args:
+            video_url: The YouTube video URL to delete
+            
+        Returns:
+            bool: True if successful, False if no data was found
+        """
+        try:
+            # Extract video ID from URL
+            video_id = video_url.split("watch?v=")[1].split("&")[0]
+            return self.delete_video_data(video_id)
+        except Exception as e:
+            logger.error(f"Error extracting video ID from URL: {str(e)}")
+            return False
+
+
+    def list_videos(self, tags: List[str] = None) -> pd.DataFrame:
+        """
+        List all videos in the database with optional tag filtering.
+        
+        Args:
+            tags: Optional list of tags to filter by
+            
+        Returns:
+            DataFrame with video information
+        """
+        try:
+            if "video_chunks" not in self.db.table_names():
+                logger.warning("No video_chunks table exists yet")
+                return pd.DataFrame()
+                
+            # Open the table
+            table = self.db.open_table("video_chunks")
+            
+            # Get all videos with their titles
+            query = "SELECT DISTINCT video_id, title, tags FROM video_chunks"
+            
+            # Filter by tags if provided
+            if tags:
+                tags_filter = " OR ".join([f"array_contains(tags, '{tag}')" for tag in tags])
+                query += f" WHERE {tags_filter}"
+                
+            results = table.query(query).to_pandas()
+            
+            # Add count of chunks for each video
+            if not results.empty:
+                # Add a column with the number of chunks for each video
+                chunk_counts = []
+                for video_id in results['video_id']:
+                    count = table.count_rows(f"video_id = '{video_id}'")
+                    chunk_counts.append(count)
+                    
+                results['num_chunks'] = chunk_counts
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error listing videos: {str(e)}")
+            return pd.DataFrame()    
+    
 def main():
     parser = argparse.ArgumentParser(description="YouTube Search QA Bot")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
@@ -476,6 +602,8 @@ def main():
                            help="Whisper model to use for transcription")
     add_parser.add_argument("--chunk-size", type=int, help="Override the default chunk size")
     add_parser.add_argument("--chunk-overlap", type=int, help="Override the default chunk overlap")
+    add_parser.add_argument("--no-update", action="store_true", 
+                           help="Don't update existing entries (add new ones instead)")
     
     # Query command
     query_parser = subparsers.add_parser("query", help="Query the video database")
@@ -485,6 +613,15 @@ def main():
     query_parser.add_argument("--tags", help="Comma-separated list of tags to filter by")
     query_parser.add_argument("--temperature", type=float, help="Temperature for the language model (0.0-1.0)")
     query_parser.add_argument("--max-tokens", type=int, help="Maximum tokens for the response")
+    
+    # Delete command
+    delete_parser = subparsers.add_parser("delete", help="Delete video data from the database")
+    delete_parser.add_argument("--video-id", help="YouTube video ID to delete")
+    delete_parser.add_argument("--url", help="YouTube video URL to delete")
+    
+    # List command
+    list_parser = subparsers.add_parser("list", help="List videos in the database")
+    list_parser.add_argument("--tags", help="Filter by comma-separated list of tags")
     
     # Parse arguments
     args = parser.parse_args()
@@ -504,7 +641,8 @@ def main():
             tags=tags,
             force=args.force if hasattr(args, 'force') else False,
             chunk_size=args.chunk_size if hasattr(args, 'chunk_size') else None,
-            chunk_overlap=args.chunk_overlap if hasattr(args, 'chunk_overlap') else None
+            chunk_overlap=args.chunk_overlap if hasattr(args, 'chunk_overlap') else None,
+            update=not args.no_update if hasattr(args, 'no_update') else True
         )
     elif args.command == "query":
         # Process video IDs if provided
@@ -527,6 +665,48 @@ def main():
         )
         print("\nAnswer:")
         print(answer)
+    elif args.command == "delete":
+        if hasattr(args, 'video_id') and args.video_id:
+            success = processor.delete_video_data(args.video_id)
+            if success:
+                print(f"Successfully deleted data for video ID: {args.video_id}")
+            else:
+                print(f"No data found for video ID: {args.video_id}")
+        elif hasattr(args, 'url') and args.url:
+            success = processor.delete_video_by_url(args.url)
+            if success:
+                print(f"Successfully deleted data for video URL: {args.url}")
+            else:
+                print(f"Failed to delete data for video URL: {args.url}")
+        else:
+            print("Please provide either --video-id or --url to delete")
+    elif args.command == "list":
+        if "video_chunks" not in processor.db.table_names():
+            print("No videos in database yet")
+            return
+            
+        # Open the table
+        table = processor.db.open_table("video_chunks")
+        
+        # Get all videos with their titles
+        query = "SELECT DISTINCT video_id, title, tags FROM video_chunks"
+        
+        # Filter by tags if provided
+        if hasattr(args, 'tags') and args.tags:
+            tags = [tag.strip() for tag in args.tags.split(',')]
+            tags_filter = " OR ".join([f"array_contains(tags, '{tag}')" for tag in tags])
+            query += f" WHERE {tags_filter}"
+            
+        results = table.query(query).to_pandas()
+        
+        if len(results) == 0:
+            print("No videos found")
+            return
+            
+        print(f"Found {len(results)} videos in database:")
+        for i, row in results.iterrows():
+            tags_str = ", ".join(row["tags"]) if row["tags"] else "No tags"
+            print(f"{i+1}. {row['title']} (ID: {row['video_id']}) - {tags_str}")
     else:
         parser.print_help()
 

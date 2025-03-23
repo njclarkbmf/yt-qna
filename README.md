@@ -2,7 +2,7 @@
 
 This application allows you to download YouTube videos, transcribe them, and create a searchable question-answering system based on the video content. It supports processing multiple videos to build a comprehensive knowledge base that you can query.
 
-Created by John Clark Naldoza
+Created by John Clark 
 
 ## Features
 
@@ -14,6 +14,8 @@ Created by John Clark Naldoza
 - Store embeddings in LanceDB for efficient similarity search
 - Answer questions across multiple videos using a language model
 - View source information with video titles and timestamps
+- Selectively update or delete embeddings for specific videos
+- List and manage your video database
 
 ## Requirements
 
@@ -119,14 +121,57 @@ echo "https://www.youtube.com/watch?v=VIDEO_ID3" >> videos.txt
 ./process_videos.sh videos.txt
 ```
 
-#### Re-downloading Videos
+#### Re-processing and Updating Videos
 
-If you try to add a video that has already been processed, the application will:
-1. Detect the existing audio file
-2. Skip the download process
-3. Use the existing file for any further processing
+If you want to update a previously processed video (for example, if the transcription needs improvement or you want to change the chunking parameters), you can now do so without resetting the entire database:
 
-This saves bandwidth and processing time when you're rebuilding your database or updating it with new videos.
+```bash
+# Re-process a video (automatically updates existing embeddings)
+python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --force
+```
+
+By default, the system will:
+1. Identify existing entries for the same video
+2. Delete those entries from the database
+3. Process the video again and store the new embeddings
+
+If you want to keep the old entries and add new ones instead (not recommended as it could create duplicates), use:
+
+```bash
+python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --force --no-update
+```
+
+### Managing Your Video Database
+
+#### Listing Videos
+
+You can view all videos in your database:
+
+```bash
+python youtube_qa_app.py list
+```
+
+This will show video IDs, titles, tags, and the number of chunks for each video.
+
+You can filter by tags:
+
+```bash
+python youtube_qa_app.py list --tags "machine-learning,tutorial"
+```
+
+#### Deleting Videos
+
+To remove a specific video from your database:
+
+```bash
+# Delete by video ID
+python youtube_qa_app.py delete --video-id "VIDEO_ID"
+
+# Delete by video URL
+python youtube_qa_app.py delete --url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+This will remove all chunks and embeddings associated with the specified video without affecting other videos in the database.
 
 ### Asking Questions About Videos
 
@@ -166,6 +211,9 @@ python youtube_qa_app.py query "Explain gradient descent" --results 10
 # Filter results to specific videos (comma-separated video IDs)
 python youtube_qa_app.py query "What is discussed about transformers?" --videos "VIDEO_ID1,VIDEO_ID3"
 
+# Filter results by tags
+python youtube_qa_app.py query "Show examples of backpropagation" --tags "neural-networks,tutorial"
+
 # Adjust the response temperature (0.0-1.0) for more/less creative answers
 python youtube_qa_app.py query "Summarize the key points" --temperature 0.7
 ```
@@ -181,11 +229,34 @@ python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --whispe
 # Force re-download and re-processing even if the video exists
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --force
 
+# Re-process without updating (adds as new entries)
+python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --force --no-update
+
 # Specify custom chunk size and overlap
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --chunk-size 600 --chunk-overlap 150
 
 # Add custom tags to videos for filtering later
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID" --tags "machine-learning,tutorial"
+```
+
+### Delete Command Parameters
+
+```bash
+# Delete by video ID
+python youtube_qa_app.py delete --video-id "VIDEO_ID"
+
+# Delete by video URL
+python youtube_qa_app.py delete --url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+### List Command Parameters
+
+```bash
+# List all videos
+python youtube_qa_app.py list
+
+# List videos with specific tags
+python youtube_qa_app.py list --tags "machine-learning,tutorial"
 ```
 
 ### Query Command Parameters
@@ -272,6 +343,21 @@ If you encounter errors when downloading videos:
 
 3. **Rate Limiting**: If you're downloading many videos in succession, YouTube might rate-limit you. Add delays between downloads.
 
+### Database Management Issues
+
+1. **Failed to Update Video**: If you encounter errors when updating a video, you can try:
+   - Deleting the video first: `python youtube_qa_app.py delete --video-id "VIDEO_ID"`
+   - Then adding it again: `python youtube_qa_app.py add "https://www.youtube.com/watch?v=VIDEO_ID"`
+
+2. **Database Corruption**: If your LanceDB database becomes corrupted, you might still need to reset it:
+   ```bash
+   ./reset_db.sh  # This will create a backup before resetting
+   # Or use the Python version
+   ./reset_db_py.sh
+   ```
+
+3. **Video ID Extraction Failure**: If you see errors about failing to extract a video ID from a URL, ensure you're using the standard YouTube URL format (`https://www.youtube.com/watch?v=VIDEO_ID`). URLs from playlists or mobile apps might need to be converted.
+
 ### FFmpeg Missing
 
 If you see errors related to FFmpeg:
@@ -315,6 +401,14 @@ If you encounter errors related to the embedding model:
 
 3. **Slow Transcription**: Transcription can be slow on CPU. Consider using a GPU if available, or use smaller Whisper models for faster (though less accurate) transcription.
 
+### LanceDB Query Errors
+
+1. **SQL Syntax Errors**: When using LanceDB's query functionality, make sure your SQL syntax is correct. The error messages should help identify the issue.
+
+2. **Missing Tables**: If you get errors about missing tables, ensure you've added at least one video before attempting queries.
+
+3. **Array Contains Errors**: The new filtering functionality uses `array_contains` for tag filtering. If you see related errors, make sure your LanceDB version supports this function.
+
 ## Data Organization
 
 When you add multiple videos, the system organizes them as follows:
@@ -332,6 +426,7 @@ This structure allows the system to:
 2. Provide accurate source attribution
 3. Support cross-video knowledge retrieval
 4. Enable efficient vector similarity search
+5. Selectively update or delete specific videos
 
 ## Customization
 
@@ -352,11 +447,26 @@ python youtube_qa_app.py add "https://www.youtube.com/watch?v=aircAruvnKk" --tag
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=IHZwWFHWa-w" --tags "neural-networks,gradient-descent,3blue1brown"
 python youtube_qa_app.py add "https://www.youtube.com/watch?v=Ilg3gGewQ5U" --tags "neural-networks,backpropagation,3blue1brown"
 
+# List videos in the database
+python youtube_qa_app.py list
+
+# List only videos with a specific tag
+python youtube_qa_app.py list --tags "backpropagation"
+
+# Update a video with better chunking parameters
+python youtube_qa_app.py add "https://www.youtube.com/watch?v=Ilg3gGewQ5U" --force --chunk-size 600 --chunk-overlap 200
+
 # Ask questions that span across videos
 python youtube_qa_app.py query "How do neural networks learn from data?" --results 8
 
 # Ask about specific topics with tag filtering
 python youtube_qa_app.py query "Explain backpropagation in detail" --tags "backpropagation"
+
+# Ask about specific videos only
+python youtube_qa_app.py query "What is covered in this specific video?" --videos "aircAruvnKk"
+
+# Remove a video from the database
+python youtube_qa_app.py delete --video-id "IHZwWFHWa-w"
 ```
 
 The system will retrieve information across all relevant videos, synthesize an answer, and show which parts came from which videos with timestamps.

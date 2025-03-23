@@ -1,0 +1,20 @@
+name: cloc code stats
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  cloc-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cloc
+        run: sudo apt-get install cloc
+
+      - name: Run cloc
+        run: cloc .
