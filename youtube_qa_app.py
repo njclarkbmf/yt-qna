@@ -47,6 +47,10 @@ class Config:
     DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1000"))
     DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.0"))
     WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+    # Qwen.ai (OpenAI-compatible) — used by the ReAct agent
+    QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+    QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
 
 # Pydantic model for LanceDB
 class VideoChunk(LanceModel):
@@ -973,7 +977,16 @@ def main():
     
     # Info command (new)
     info_parser = subparsers.add_parser("info", help="Display system information")
-    
+
+    # Agent command — ReAct reasoning over video content (uses Qwen.ai)
+    agent_parser = subparsers.add_parser(
+        "agent", help="Ask a question using the ReAct reasoning agent (Qwen.ai)"
+    )
+    agent_parser.add_argument("question", help="Question to ask about the video library")
+    agent_parser.add_argument(
+        "--quiet", action="store_true", help="Hide reasoning trace, show only the final answer"
+    )
+
     # Parse arguments
     args = parser.parse_args()
     
@@ -985,7 +998,20 @@ def main():
     
     # Commands that can use lightweight processing
     fast_compatible_commands = ["list", "delete", "info"]
-    
+
+    # Agent command is self-contained — handle before processor init
+    if args.command == "agent":
+        from agent_qa import YouTubeReActAgent
+        agent = YouTubeReActAgent()
+        verbose = not args.quiet if hasattr(args, 'quiet') else True
+        print(f"\nQuestion: {args.question}\n")
+        if verbose:
+            print("=== Agent Reasoning Trace ===")
+        answer = agent.run(args.question, verbose=verbose)
+        print("\n=== Final Answer ===")
+        print(answer)
+        return
+
     if args.command in fast_compatible_commands or fast_mode:
         # Process commands that don't need the full models loaded
         if args.command == "list":

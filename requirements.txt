@@ -3,6 +3,7 @@ sentence-transformers
 lancedb
 langchain
 langchain-openai
+langchain-community
 python-dotenv
 tqdm
 pandas
